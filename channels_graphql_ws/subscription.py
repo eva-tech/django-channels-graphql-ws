@@ -47,6 +47,7 @@ from .serializer import Serializer
 LOG = logging.getLogger(__name__)
 
 
+
 class Subscription(graphene.ObjectType):
     """Subscription type definition.
 
@@ -296,6 +297,8 @@ class Subscription(graphene.ObjectType):
         return graphene.Field(
             cls._meta.output,
             args=cls._meta.arguments,
+            # eva-tech: no wrapper. The consumer runs `graphql.execute` in its
+            # pool, so a sync `publish` already runs outside the event loop.
             resolver=cls._meta.publish,
             name=name,
             description=description,
