@@ -28,9 +28,12 @@ import threading
 
 import channels.db
 import channels.layers
+import django.db
+import django.db.backends.sqlite3.base
 import graphene
 import graphql
 import pytest
+from django.contrib.auth.models import User
 
 import channels_graphql_ws
 from channels_graphql_ws.graphql_ws_consumer import GraphqlWsConsumer, call_maybe_sync
@@ -99,15 +102,8 @@ async def test_call_maybe_sync_runs_a_sync_callback_in_the_pool():
 
 
 @pytest.mark.asyncio
-async def test_call_maybe_sync_awaits_an_async_callback_in_the_loop(monkeypatch):
-    """An async callback is awaited in the event loop thread, not offloaded.
-
-    It never goes through the pool, so `close_old_connections` does not run.
-    """
-    calls = []
-    monkeypatch.setattr(
-        channels.db, "close_old_connections", lambda: calls.append("close")
-    )
+async def test_call_maybe_sync_awaits_an_async_callback_in_the_loop():
+    """An async callback is awaited in the event loop thread, not offloaded."""
     loop_thread = threading.current_thread()
 
     async def callback(value):
@@ -117,32 +113,89 @@ async def test_call_maybe_sync_awaits_an_async_callback_in_the_loop(monkeypatch)
 
     assert value == 42
     assert thread is loop_thread
-    assert calls == []
+
+
+@pytest.fixture
+def closable_sqlite(monkeypatch):
+    """Let the test database connections of the worker threads close.
+
+    The tests run on an in-memory SQLite database, and Django's SQLite
+    backend ignores `close()` on an in-memory database. With that guard off,
+    `close_old_connections` closes a worker's connection as it does with
+    Postgres in evapacs-back. The database survives because the test thread
+    keeps its own connection open.
+    """
+    monkeypatch.setattr(
+        django.db.backends.sqlite3.base.DatabaseWrapper,
+        "is_in_memory_db",
+        lambda self: False,
+    )
+    assert django.db.connection.settings_dict["CONN_MAX_AGE"] == 0
 
 
 @pytest.mark.asyncio
-async def test_run_in_worker_closes_old_connections_around_the_call(monkeypatch):
-    """`close_old_connections` runs before and after the call, also on error."""
-    calls = []
-    monkeypatch.setattr(
-        channels.db, "close_old_connections", lambda: calls.append("close")
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_sync_callbacks_query_the_db_and_close_the_connection(
+    gql, closable_sqlite, subprotocol
+):
+    """Sync `subscribe` and `publish` query the ORM and leave no connection open.
+
+    The client gets the user count that `publish` reads from the database.
+    With CONN_MAX_AGE = 0 the connection each worker thread opened for its
+    query is closed once the callback returns, as Django does at the end of
+    an HTTP request.
+    """
+    del closable_sqlite
+    OnUserCount.connections.clear()
+    user_count = await channels.db.database_sync_to_async(User.objects.count)()
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol=subprotocol,
     )
+    await client.connect_and_init()
 
-    def callback():
-        calls.append("callback")
-        return "result"
+    sub_id = await client.start(query="subscription { on_user_count { count } }")
+    await client.assert_no_messages()
+    await OnUserCount.broadcast_async(payload=None)
+    resp = await client.receive_next(sub_id)
+    assert resp["data"]["on_user_count"]["count"] == user_count
 
-    def failing_callback():
-        calls.append("failing_callback")
-        raise ValueError("Boom!")
+    assert set(OnUserCount.connections) == {"subscribe", "publish"}
+    for callback, connection in OnUserCount.connections.items():
+        assert connection.connection is None, f"{callback} left its connection open!"
 
-    assert await call_maybe_sync(callback) == "result"
-    assert calls == ["close", "callback", "close"]
+    await client.finalize()
 
-    calls.clear()
-    with pytest.raises(ValueError, match="Boom!"):
-        await call_maybe_sync(failing_callback)
-    assert calls == ["close", "failing_callback", "close"]
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_failed_sync_subscribe_closes_the_connection(
+    gql, closable_sqlite, subprotocol
+):
+    """A sync `subscribe` that queries the ORM and raises still closes it."""
+    del closable_sqlite
+    OnUserCount.connections.clear()
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol=subprotocol,
+    )
+    await client.connect_and_init()
+
+    sub_id = await client.start(
+        query="subscription { on_user_count(fail: true) { count } }"
+    )
+    errors, data = await client.receive_error(sub_id)
+    assert data is None
+    assert errors[0]["message"] == f"RuntimeError: {OnUserCount.ERROR}"
+    if subprotocol == "graphql-ws":
+        await client.receive_complete(sub_id)
+
+    connection = OnUserCount.connections["subscribe"]
+    assert connection.connection is None, "subscribe left its connection open!"
+
+    await client.finalize()
 
 
 @pytest.mark.asyncio
@@ -401,6 +454,40 @@ class OnEvent(channels_graphql_ws.Subscription):
         OnEvent.threads["unsubscribed"] = threading.current_thread().name
 
 
+class OnUserCount(channels_graphql_ws.Subscription):
+    """Subscription whose callbacks query the database."""
+
+    # pylint: disable=arguments-differ
+
+    ERROR = "No access!"
+
+    connections: dict = {}
+
+    count = graphene.Int()
+
+    class Arguments:
+        """Subscription arguments."""
+
+        fail = graphene.Boolean(default_value=False)
+
+    @staticmethod
+    def subscribe(root, info, fail):
+        """Check access with a query, as evapacs-back does."""
+        del root, info
+        OnUserCount.connections["subscribe"] = django.db.connections["default"]
+        User.objects.count()
+        if fail:
+            raise RuntimeError(OnUserCount.ERROR)
+        return []
+
+    @staticmethod
+    def publish(payload, info, fail):
+        """Send the user count read from the database."""
+        del payload, info, fail
+        OnUserCount.connections["publish"] = django.db.connections["default"]
+        return OnUserCount(count=User.objects.count())
+
+
 class OnFailingSubscribe(channels_graphql_ws.Subscription):
     """Subscription whose `subscribe` raises."""
 
@@ -428,6 +515,7 @@ class Subscription(graphene.ObjectType):
 
     on_event = OnEvent.Field()
     on_failing_subscribe = OnFailingSubscribe.Field()
+    on_user_count = OnUserCount.Field()
 
 
 class Query(graphene.ObjectType):
