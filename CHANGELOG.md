@@ -23,6 +23,37 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 # Changelog
 
+## Unreleased
+
+- Requirements: Django 4.2.*, graphql-core >=3.2.13,<3.3.
+- Travis and GitLab CI run on Python 3.10.
+- Tests for the behavior kept from 0.9.1, in `tests/test_eva_tech.py`.
+
+## [1.0.0rc7+eva1]
+
+eva-tech fork of 1.0.0rc7. It keeps what 0.9.1 did, so evapacs-back can
+move to graphene 3 without changing how subscriptions behave. Each
+change is marked `eva-tech:` in the code.
+
+- The group name prefix is `GRAPHQL_WS_SUBSCRIPTION`, not `GQLWS`.
+  Services on 0.9.1 and on this version join the same groups, so a
+  broadcast from either one reaches every subscriber during a deploy or
+  a rollback.
+- Sync `subscribe`, `unsubscribed` and `publish` callbacks, and the
+  `graphql.execute` of each notification, run in one thread pool per
+  process with threads named `GraphqlWs.`. `close_old_connections` runs
+  before and after each call, also when the call raises. Async
+  callbacks are awaited in the event loop. `max_worker_threads` sets the
+  pool size.
+- `GraphqlWsConsumer.execution_context_class` builds the execution
+  context of every operation on the socket: queries, mutations, the
+  subscription source stream and each notification. The source stream
+  uses a copy of `create_source_event_stream` from graphql-core 3.2.13.
+- With the `graphql-ws` subprotocol, a subscribe that fails sends `data`
+  with the error and then `complete`. `graphql-transport-ws` still sends
+  only `error`.
+- Requirements: Python >=3.10.
+
 ## [1.0.0rc7] - 2023-08-17
 
 - Supported the most recent WebSocket sub-protocol
