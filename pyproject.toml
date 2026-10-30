@@ -49,9 +49,9 @@ python = ">=3.10,<4"
 aiohttp = "^3"
 asgiref = "^3"
 channels = ">=4.0,<5"
-Django = ">=3.2,<6"
+Django = ">=4.2,<4.3"
 graphene = "^3"
-graphql-core = ">=3.2.3,<3.3" # Carefully test after upgrade, since we path private internals.
+graphql-core = ">=3.2.13,<3.3" # Carefully test after upgrade, since we path private internals.
 msgpack = "^1"
 
 # Development dependencies.
