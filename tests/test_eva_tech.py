@@ -24,13 +24,16 @@
 # NOTE: In this file we use `strict_ordering=True` to simplify testing.
 
 import asyncio
+import contextvars
 import hashlib
+import os
 import threading
 
 import channels.db
 import channels.layers
 import django.db
 import django.db.backends.sqlite3.base
+import django.utils.translation
 import graphene
 import graphql
 import pytest
@@ -361,6 +364,108 @@ async def test_failed_notification_ends_the_operation(gql, subprotocol):
     assert resp["data"]["on_event"]["value"] == "again"
 
     await client.finalize()
+
+
+# ---------------------------------- POOL SIZE, BACKPRESSURE AND CONTEXT
+
+
+@pytest.fixture(name="fresh_pool")
+def fixture_fresh_pool(monkeypatch):
+    """Give the test its own pool, created on first use, and shut it down after."""
+    # pylint: disable=protected-access
+    monkeypatch.setattr(GraphqlWsConsumer, "_workers", None)
+    yield monkeypatch
+    if GraphqlWsConsumer._workers is not None:
+        GraphqlWsConsumer._workers.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_pool_default_size_is_the_executor_default(fresh_pool):
+    """Without `max_worker_threads` the pool has min(32, CPUs + 4) threads."""
+    # pylint: disable=protected-access
+    fresh_pool.setattr(GraphqlWsConsumer, "max_worker_threads", None)
+
+    await call_maybe_sync(lambda: None)
+
+    workers = GraphqlWsConsumer._workers
+    assert workers._max_workers == min(32, (os.cpu_count() or 1) + 4)
+
+
+@pytest.mark.asyncio
+async def test_max_worker_threads_caps_the_pool(fresh_pool):
+    """With `max_worker_threads = 1` two sync callbacks run one after the other."""
+    fresh_pool.setattr(GraphqlWsConsumer, "max_worker_threads", 1)
+    lock = threading.Lock()
+    running = []
+    overlaps = []
+
+    def callback():
+        with lock:
+            running.append(1)
+            overlaps.append(len(running))
+        threading.Event().wait(0.1)
+        with lock:
+            running.pop()
+        return threading.current_thread().name
+
+    names = await asyncio.gather(call_maybe_sync(callback), call_maybe_sync(callback))
+
+    assert overlaps == [1, 1]
+    assert names[0] == names[1]
+
+
+@pytest.mark.asyncio
+async def test_full_pool_queues_notifications_without_dropping_them(gql, fresh_pool):
+    """With every thread busy, notifications wait for one and all arrive in order."""
+    fresh_pool.setattr(GraphqlWsConsumer, "max_worker_threads", 1)
+    client = gql(subscription=Subscription, subprotocol="graphql-transport-ws")
+    await client.connect_and_init()
+    sub_id = await client.start(query="subscription { on_event(user_id: 1) { value } }")
+    await client.assert_no_messages()
+
+    release = threading.Event()
+    blocker = asyncio.create_task(call_maybe_sync(release.wait, 5))
+    payloads = [f"n{number}" for number in range(5)]
+    for payload in payloads:
+        await OnEvent.broadcast_async(group="user_1", payload=payload)
+    await client.assert_no_messages()
+    release.set()
+    assert await blocker
+
+    received = [
+        (await client.receive_next(sub_id))["data"]["on_event"]["value"]
+        for _ in payloads
+    ]
+    assert received == payloads
+
+    await client.finalize()
+
+
+REQUEST_ID: contextvars.ContextVar = contextvars.ContextVar("request_id")
+
+
+@pytest.mark.asyncio
+async def test_pool_runs_each_call_in_a_copy_of_the_caller_context():
+    """The worker sees the caller's context vars, and its changes stay in it.
+
+    The active Django translation is an asgiref `Local`, which lives in a
+    context var, so a sync callback answers in the caller's language.
+    """
+
+    def callback():
+        seen = (REQUEST_ID.get(None), django.utils.translation.get_language())
+        REQUEST_ID.set("changed in the worker")
+        return seen
+
+    token = REQUEST_ID.set("from the caller")
+    try:
+        with django.utils.translation.override("es"):
+            seen = await call_maybe_sync(callback)
+        assert REQUEST_ID.get() == "from the caller"
+    finally:
+        REQUEST_ID.reset(token)
+
+    assert seen == ("from the caller", "es")
 
 
 # ------------------------------------- create_source_event_stream COPY
