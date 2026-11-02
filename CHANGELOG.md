@@ -25,7 +25,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Unreleased
 
-- Requirements: Django 4.2.*, graphql-core >=3.2.13,<3.3.
+- Requirements: Django 4.2.*, graphql-core 3.2.13.
 - Travis and GitLab CI run on Python 3.10.
 - Tests for the behavior kept from 0.9.1, in `tests/test_eva_tech.py`.
 - A STOP that arrives while a sync `subscribe` runs in the pool now

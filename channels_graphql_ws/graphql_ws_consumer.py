@@ -949,6 +949,8 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     # IntrospectionQuery. There no real resolvers. Only
                     # the type information.
                     middleware_manager = None
+                # eva-tech: unlike 0.9.1 this runs in the event loop, where an ORM
+                # resolver raises. evapacs-back clients only send subscriptions.
                 exec_result = graphql.execution.execute(
                     self.schema.graphql_schema,
                     document=doc_ast,

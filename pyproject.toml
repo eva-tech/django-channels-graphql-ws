@@ -51,7 +51,7 @@ asgiref = "^3"
 channels = ">=4.0,<5"
 Django = "4.2.*"
 graphene = "^3"
-graphql-core = ">=3.2.13,<3.3" # Carefully test after upgrade, since we path private internals.
+graphql-core = "3.2.13" # Carefully test after upgrade, since we path private internals.
 msgpack = "^1"
 
 # Development dependencies.
