@@ -89,7 +89,6 @@ from .serializer import Serializer
 LOG = logging.getLogger(__name__)
 
 
-
 async def call_maybe_sync(function, *args, **kwds):
     """Await an async callback, or run a sync one in a worker thread.
 
@@ -105,6 +104,7 @@ async def call_maybe_sync(function, *args, **kwds):
     if inspect.isawaitable(result):
         result = await result
     return result
+
 
 class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     """Channels consumer for the WebSocket GraphQL backend.
@@ -829,6 +829,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     op_name,
                 )
 
+                # eva-tech: set once `subscribe` ran and the operation is in
+                # the registry, or once it failed.
+                registered = asyncio.Event()
+
                 # This returns asynchronous generator or ExecutionResult
                 # instance in case of error.
                 subscription_result = await self._on_gql_subscribe__create_subscription(
@@ -842,6 +846,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                         self._on_gql_subscribe__initialize_subscription_stream,
                         op_id,
                         op_name,
+                        registered,
                     ),
                     middleware=self._middleware,
                 )
@@ -863,10 +868,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                             errors=self.subscription_confirmation_message["errors"],
                         )
 
-                    consumer_init_done = asyncio.Event()
-
                     async def consume_stream():
-                        consumer_init_done.set()
                         try:
                             async for item in stream:
                                 # Skipped subscription event may have no
@@ -899,7 +901,8 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
 
                     # We need to end this task when client drops
                     # connection or unsubscribes, so lets store it.
-                    self._notifier_tasks[op_id] = asyncio.create_task(consume_stream())
+                    notifier_task = asyncio.create_task(consume_stream())
+                    self._notifier_tasks[op_id] = notifier_task
 
                     # We must be sure here that the subscription
                     # initialization is finished and the stream consumer
@@ -910,7 +913,14 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     # actually is.
                     # This allows us to avoid the race condition between
                     # simultaneous subscribe and unsubscribe calls.
-                    await consumer_init_done.wait()
+                    # eva-tech: wait until `subscribe` registered the operation. It
+                    # runs in the pool, and a STOP before it ended found nothing.
+                    registered_task = asyncio.create_task(registered.wait())
+                    await asyncio.wait(
+                        [registered_task, notifier_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    registered_task.cancel()
                     return
 
                 # Else (when gql_subscribe returns ExecutionResult
@@ -1120,6 +1130,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             nearly identical to the "ExecuteQuery" algorithm, for which
             :func:`~graphql.execute` is also used.
             """
+
             # eva-tech: run `publish` and the resolvers of its fields in the
             # pool, as 0.9.1 did, not in the event loop. In the loop, 200
             # sockets of one org meant 200 executions without yielding, and
@@ -1158,6 +1169,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         self,
         operation_id: int,
         operation_name: str,
+        registered: asyncio.Event,
         root: Any,
         info: graphql.GraphQLResolveInfo,
         *args,
@@ -1302,6 +1314,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         )
         if wait_list:
             await asyncio.wait(wait_list)
+        registered.set()
 
         # For each notification (event) yielded from this function the
         # `_on_gql_subscribe__create_subscription` function will call

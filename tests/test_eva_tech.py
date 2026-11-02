@@ -23,6 +23,7 @@
 
 # NOTE: In this file we use `strict_ordering=True` to simplify testing.
 
+import asyncio
 import hashlib
 import threading
 
@@ -280,6 +281,39 @@ async def test_failed_subscribe_graphql_transport_ws_sends_only_error(gql):
     await client.finalize()
 
 
+# ------------------------------------------------ STOP DURING SUBSCRIBE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_stop_while_subscribe_runs_unsubscribes(gql, subprotocol):
+    """A STOP that arrives while `subscribe` runs in the pool still unsubscribes.
+
+    Before the fix the STOP found no operation, sent no `complete`, and later
+    broadcasts reached a subscription the client had stopped.
+    """
+    OnSlowSubscribe.reset()
+    client = gql(subscription=Subscription, subprotocol=subprotocol)
+    await client.connect_and_init()
+
+    sub_id = await client.start(query="subscription { on_slow_subscribe { value } }")
+    entered = await asyncio.get_running_loop().run_in_executor(
+        None, OnSlowSubscribe.entered.wait, 5
+    )
+    assert entered, "subscribe never started!"
+    await client.complete(sub_id)
+    # The consumer takes the STOP while `subscribe` still waits in the pool.
+    await asyncio.sleep(0.2)
+    OnSlowSubscribe.release.set()
+
+    await client.receive_complete(sub_id)
+    await OnSlowSubscribe.broadcast_async(payload="late")
+    await client.assert_no_messages()
+    assert OnSlowSubscribe.unsubscribed_calls == 1
+
+    await client.finalize()
+
+
 # ------------------------------------- create_source_event_stream COPY
 
 
@@ -510,11 +544,51 @@ class OnFailingSubscribe(channels_graphql_ws.Subscription):
         raise AssertionError("publish must not run!")
 
 
+class OnSlowSubscribe(channels_graphql_ws.Subscription):
+    """Subscription whose `subscribe` waits until the test releases it."""
+
+    # pylint: disable=arguments-differ
+
+    entered = threading.Event()
+    release = threading.Event()
+    unsubscribed_calls = 0
+
+    value = graphene.String()
+
+    @classmethod
+    def reset(cls):
+        """Prepare a new run."""
+        cls.entered = threading.Event()
+        cls.release = threading.Event()
+        cls.unsubscribed_calls = 0
+
+    @staticmethod
+    def subscribe(root, info):
+        """Wait in the pool, as a slow access check does."""
+        del root, info
+        OnSlowSubscribe.entered.set()
+        assert OnSlowSubscribe.release.wait(5), "the test never released subscribe!"
+        return []
+
+    @staticmethod
+    def publish(payload, info):
+        """Send the payload."""
+        del info
+        return OnSlowSubscribe(value=payload)
+
+    @staticmethod
+    def unsubscribed(root, info):
+        """Count the calls."""
+        del root, info
+        OnSlowSubscribe.unsubscribed_calls += 1
+
+
 class Subscription(graphene.ObjectType):
     """Root subscription."""
 
     on_event = OnEvent.Field()
     on_failing_subscribe = OnFailingSubscribe.Field()
+    on_slow_subscribe = OnSlowSubscribe.Field()
     on_user_count = OnUserCount.Field()
 
 
