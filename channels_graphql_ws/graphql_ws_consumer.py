@@ -898,6 +898,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                                 # complete, so this ends it the same way.
                                 await self._send_gql_next(op_id, None, [ex])
                                 await self._send_gql_complete(op_id)
+                            # eva-tech: the error ended the operation. Drop it, or
+                            # each later broadcast fills a queue nobody reads.
+                            await self._on_gql_complete(op_id, from_notifier=True)
 
                     # We need to end this task when client drops
                     # connection or unsubscribes, so lets store it.
@@ -1211,9 +1214,16 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             # eva-tech: a sync `subscribe` runs in a worker thread. This method
             # runs in the event loop thread, where Django refuses ORM queries
             # (SynchronousOnlyOperation), and access checks query the database.
-            subclass_groups = await call_maybe_sync(
-                subscription_class._meta.subscribe, root, info, *args, **kwds
-            )
+            try:
+                subclass_groups = await call_maybe_sync(
+                    subscription_class._meta.subscribe, root, info, *args, **kwds
+                )
+            except Exception as ex:
+                # eva-tech: locate it like a resolver error, as 0.9.1 sent it: the
+                # plain message with `locations` and `path`, not "Class: message".
+                raise graphql.located_error(
+                    ex, info.field_nodes, info.path.as_list()
+                ) from ex
             assert subclass_groups is None or isinstance(
                 subclass_groups, (list, tuple)
             ), (
@@ -1329,10 +1339,13 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             with notification_queue_lock:
                 notification_queue.task_done()
 
-    async def _on_gql_complete(self, op_id):
+    async def _on_gql_complete(self, op_id, *, from_notifier=False):
         """Process the COMPLETE/STOP message.
 
         Handle an unsubscribe request.
+
+        eva-tech: with `from_notifier` the notifier task drops its own
+        operation after a failure it already reported to the client.
 
         NOTE: Depending on the value of the `strict_ordering` setting
         this method is either awaited directly or offloaded to an async
@@ -1354,7 +1367,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
 
         # Cancel the task which watches the notification queue.
         consumer_task = self._notifier_tasks.pop(op_id, None)
-        if consumer_task:
+        if consumer_task and not from_notifier:
             consumer_task.cancel()
             wait_list.append(consumer_task)
 
@@ -1383,7 +1396,8 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         await sub_inf.unsubscribed_callback()
 
         # Send the unsubscription confirmation message.
-        await self._send_gql_complete(op_id)
+        if not from_notifier:
+            await self._send_gql_complete(op_id)
 
     # -------------------------------------------------------- GRAPHQL PROTOCOL MESSAGES
 

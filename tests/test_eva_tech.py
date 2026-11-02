@@ -189,7 +189,8 @@ async def test_failed_sync_subscribe_closes_the_connection(
     )
     errors, data = await client.receive_error(sub_id)
     assert data is None
-    assert errors[0]["message"] == f"RuntimeError: {OnUserCount.ERROR}"
+    assert errors[0]["message"] == OnUserCount.ERROR
+    assert errors[0]["path"] == ["on_user_count"]
     if subprotocol == "graphql-ws":
         await client.receive_complete(sub_id)
 
@@ -251,7 +252,9 @@ async def test_failed_subscribe_graphql_ws_sends_data_then_complete(gql):
     errors, data = await client.receive_error(sub_id)
     assert data is None
     assert len(errors) == 1
-    assert errors[0]["message"] == f"RuntimeError: {OnFailingSubscribe.ERROR}"
+    assert errors[0]["message"] == OnFailingSubscribe.ERROR
+    assert errors[0]["path"] == ["on_failing_subscribe"]
+    assert errors[0]["locations"] == [{"line": 1, "column": 16}]
     await client.receive_complete(sub_id)
     await client.assert_no_messages()
 
@@ -275,7 +278,9 @@ async def test_failed_subscribe_graphql_transport_ws_sends_only_error(gql):
     errors, data = await client.receive_error(sub_id)
     assert data is None
     assert len(errors) == 1
-    assert errors[0]["message"] == f"RuntimeError: {OnFailingSubscribe.ERROR}"
+    assert errors[0]["message"] == OnFailingSubscribe.ERROR
+    assert errors[0]["path"] == ["on_failing_subscribe"]
+    assert errors[0]["locations"] == [{"line": 1, "column": 16}]
     await client.assert_no_messages()
 
     await client.finalize()
@@ -310,6 +315,50 @@ async def test_stop_while_subscribe_runs_unsubscribes(gql, subprotocol):
     await OnSlowSubscribe.broadcast_async(payload="late")
     await client.assert_no_messages()
     assert OnSlowSubscribe.unsubscribed_calls == 1
+
+    await client.finalize()
+
+
+# --------------------------------------------------- FAILED NOTIFICATION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_failed_notification_ends_the_operation(gql, subprotocol):
+    """A notification that fails outside the resolvers ends its operation.
+
+    The client gets the error, `unsubscribed` runs, and the operation id is
+    free again. Before the fix the id stayed taken: graphql-ws answered
+    "already exists" and graphql-transport-ws closed the socket with 4409.
+    """
+    OnEvent.threads.clear()
+    FailingNotificationContext.fail = False
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"execution_context_class": FailingNotificationContext},
+        subprotocol=subprotocol,
+    )
+    await client.connect_and_init()
+    query = "subscription { on_event(user_id: 1) { value } }"
+
+    sub_id = await client.start(query=query)
+    await client.assert_no_messages()
+    FailingNotificationContext.fail = True
+    await OnEvent.broadcast_async(group="user_1", payload="hello")
+    errors, data = await client.receive_error(sub_id)
+    assert data is None
+    assert errors[0]["message"] == f"RuntimeError: {FailingNotificationContext.ERROR}"
+    if subprotocol == "graphql-ws":
+        await client.receive_complete(sub_id)
+    FailingNotificationContext.fail = False
+    await client.assert_no_messages()
+    assert "unsubscribed" in OnEvent.threads
+
+    await client.start(query=query, msg_id=sub_id)
+    await client.assert_no_messages()
+    await OnEvent.broadcast_async(group="user_1", payload="again")
+    resp = await client.receive_next(sub_id)
+    assert resp["data"]["on_event"]["value"] == "again"
 
     await client.finalize()
 
@@ -542,6 +591,20 @@ class OnFailingSubscribe(channels_graphql_ws.Subscription):
         """Never runs."""
         del payload, info
         raise AssertionError("publish must not run!")
+
+
+class FailingNotificationContext(graphql.ExecutionContext):
+    """Execution context that fails, on demand, outside the resolvers."""
+
+    ERROR = "Notification failed!"
+
+    fail = False
+
+    def __init__(self, *args, **kwds):
+        """Raise while `fail` is on."""
+        if FailingNotificationContext.fail:
+            raise RuntimeError(FailingNotificationContext.ERROR)
+        super().__init__(*args, **kwds)
 
 
 class OnSlowSubscribe(channels_graphql_ws.Subscription):

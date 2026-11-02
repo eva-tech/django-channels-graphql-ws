@@ -31,6 +31,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 - A STOP that arrives while a sync `subscribe` runs in the pool now
   unsubscribes. The subscribe waits until the operation is registered,
   as 0.9.1 did, instead of until the notifier task starts.
+- A failing `subscribe` sends its error with `locations` and `path` and
+  without the exception class prefix, as 0.9.1 did. A notification that
+  fails outside the resolvers ends its operation and frees its id.
 
 ## [1.0.0rc7+eva1]
 
