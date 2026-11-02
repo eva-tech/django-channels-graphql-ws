@@ -23,18 +23,6 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 # Changelog
 
-## Unreleased
-
-- Requirements: Django 4.2.*, graphql-core 3.2.13.
-- Travis and GitLab CI run on Python 3.10.
-- Tests for the behavior kept from 0.9.1, in `tests/test_eva_tech.py`.
-- A STOP that arrives while a sync `subscribe` runs in the pool now
-  unsubscribes. The subscribe waits until the operation is registered,
-  as 0.9.1 did, instead of until the notifier task starts.
-- A failing `subscribe` sends its error with `locations` and `path` and
-  without the exception class prefix, as 0.9.1 did. A notification that
-  fails outside the resolvers ends its operation and frees its id.
-
 ## [1.0.0rc7+eva1]
 
 eva-tech fork of 1.0.0rc7. It keeps what 0.9.1 did, so evapacs-back can
@@ -58,7 +46,15 @@ change is marked `eva-tech:` in the code.
 - With the `graphql-ws` subprotocol, a subscribe that fails sends `data`
   with the error and then `complete`. `graphql-transport-ws` still sends
   only `error`.
-- Requirements: Python >=3.10.
+- Travis and GitLab CI run on Python 3.10.
+- Tests for the behavior kept from 0.9.1, in `tests/test_eva_tech.py`.
+- A STOP that arrives while a sync `subscribe` runs in the pool now
+  unsubscribes. The subscribe waits until the operation is registered,
+  as 0.9.1 did, instead of until the notifier task starts.
+- A failing `subscribe` sends its error with `locations` and `path` and
+  without the exception class prefix, as 0.9.1 did. A notification that
+  fails outside the resolvers ends its operation and frees its id.
+- Requirements: Python >=3.10, Django 4.2.*, graphql-core 3.2.13.
 
 ## [1.0.0rc7] - 2023-08-17
 
