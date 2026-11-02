@@ -322,6 +322,35 @@ async def test_stop_while_subscribe_runs_unsubscribes(gql, subprotocol):
     await client.finalize()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_disconnect_while_subscribe_runs_leaves_no_pending_task(gql, subprotocol):
+    """A disconnect while `subscribe` runs in the pool leaves no task behind.
+
+    Before the fix the task waiting for the registration stayed pending
+    forever, because the cancelled subscribe never cancelled it.
+    """
+    OnSlowSubscribe.reset()
+    client = gql(subscription=Subscription, subprotocol=subprotocol)
+    await client.connect_and_init()
+
+    await client.start(query="subscription { on_slow_subscribe { value } }")
+    entered = await asyncio.get_running_loop().run_in_executor(
+        None, OnSlowSubscribe.entered.wait, 5
+    )
+    assert entered, "subscribe never started!"
+    await client.finalize()
+    OnSlowSubscribe.release.set()
+    await asyncio.sleep(0.2)
+
+    pending = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_coro().__qualname__ == "Event.wait"
+    ]
+    assert not pending, f"Tasks still wait for the registration: {pending}"
+
+
 # --------------------------------------------------- FAILED NOTIFICATION
 
 

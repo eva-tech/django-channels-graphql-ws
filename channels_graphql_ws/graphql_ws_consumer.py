@@ -919,11 +919,15 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     # eva-tech: wait until `subscribe` registered the operation. It
                     # runs in the pool, and a STOP before it ended found nothing.
                     registered_task = asyncio.create_task(registered.wait())
-                    await asyncio.wait(
-                        [registered_task, notifier_task],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    registered_task.cancel()
+                    try:
+                        await asyncio.wait(
+                            [registered_task, notifier_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        # eva-tech: a disconnect cancels this wait, and then
+                        # nothing sets `registered`, so the task would hang.
+                        registered_task.cancel()
                     return
 
                 # Else (when gql_subscribe returns ExecutionResult
