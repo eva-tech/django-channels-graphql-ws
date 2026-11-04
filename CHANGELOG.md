@@ -46,7 +46,7 @@ change is marked `eva-tech:` in the code.
 - With the `graphql-ws` subprotocol, a subscribe that fails sends `data`
   with the error and then `complete`. `graphql-transport-ws` still sends
   only `error`.
-- Travis and GitLab CI run on Python 3.10.
+- GitHub Actions runs the tests on Python 3.10 with the locked Poetry 1.8.3.
 - Tests for the behavior kept from 0.9.1, in `tests/test_eva_tech.py`.
 - A STOP that arrives while a sync `subscribe` runs in the pool now
   unsubscribes. The subscribe waits until the operation is registered,
