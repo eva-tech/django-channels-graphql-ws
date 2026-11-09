@@ -153,7 +153,6 @@ async def test_custom_confirmation_message(gql, subprotocol):
     expected_errors = [
         {
             "message": f"{type(expected_error).__name__}: {expected_error}",
-            "extensions": {"code": "RuntimeError"},
         }
     ]
     payload = ex.value.response["payload"]

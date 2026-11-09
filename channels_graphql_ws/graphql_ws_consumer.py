@@ -106,6 +106,93 @@ async def call_maybe_sync(function, *args, **kwds):
     return result
 
 
+def _loggable_traceback(error: BaseException) -> str:
+    """Format `error` as 0.9.1 logged it, without the query text.
+
+    eva-tech: graphql-core 3 adds the query to `str(GraphQLError)`, so log the
+    original exception, or only the message when there is none.
+    """
+    if isinstance(error, graphql.GraphQLError):
+        if error.original_error is None:
+            return f"{type(error).__name__}: {error.message}"
+        error = error.original_error
+    return "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    ).strip()
+
+
+def _raised_by_publish(error: graphql.GraphQLError) -> bool:
+    """Tell whether `publish`, the root field resolver, raised `error`."""
+    return (
+        error.original_error is not None
+        and not isinstance(error.original_error, graphql.GraphQLError)
+        and error.path is not None
+        and len(error.path) == 1
+    )
+
+
+def _raised_below_publish(error: Exception) -> bool:
+    """Tell whether a resolver of a field below `publish` raised `error`."""
+    return (
+        isinstance(error, graphql.GraphQLError)
+        and error.path is not None
+        and len(error.path) > 1
+    )
+
+
+def _log_like_graphql_core_2(
+    error: graphql.GraphQLError,
+    schema: graphql.GraphQLSchema,
+    document: graphql.DocumentNode,
+):
+    """Log a field error with the loggers and texts of graphql-core 2.
+
+    eva-tech: 0.9.1 ran on graphql-core 2, which logged it this way, so the
+    error keeps its Sentry issue.
+    """
+    original = error.original_error or error
+    field_node = error.nodes[0] if error.nodes else None
+    parent_name = _parent_type_name(schema, document, field_node)
+    field_name = field_node.name.value if field_node else error.path[-1]
+    logging.getLogger("graphql.execution.executor").error(
+        "An error occurred while resolving field %s.%s",
+        parent_name,
+        field_name,
+        exc_info=(type(original), original, original.__traceback__),
+    )
+    logging.getLogger("graphql.execution.utils").error(
+        "".join(
+            traceback.format_exception(type(original), original, original.__traceback__)
+        )
+    )
+
+
+def _parent_type_name(schema, document, field_node) -> Optional[str]:
+    """Return the name of the type that holds `field_node` in `document`."""
+    if field_node is None:
+        return None
+    type_info = graphql.TypeInfo(schema)
+    found = []
+
+    class FindParent(graphql.Visitor):
+        """Record the parent type when the visit reaches `field_node`."""
+
+        def enter_field(self, node, *_args):
+            """Stop at the field node of the error."""
+            if node is field_node:
+                parent = type_info.get_parent_type()
+                found.append(parent.name if parent else None)
+                return graphql.BREAK
+            return None
+
+    graphql.visit(document, graphql.TypeInfoVisitor(type_info, FindParent()))
+    return found[0] if found else None
+
+
+class SkippedNotification(Exception):
+    """Raised by the `publish` resolver when `publish` returned `SKIP`."""
+
+
 class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     """Channels consumer for the WebSocket GraphQL backend.
 
@@ -149,6 +236,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     # different clients (within different WebSocket connections)
     # are still processed asynchronously. Useful for tests.
     strict_ordering: bool = False
+
+    # eva-tech: 0.9.1's marker. A `publish` that returns it sends nothing to
+    # that client, while a `publish` that returns `None` sends null.
+    SKIP = object()
 
     # When set to `True` the server will send an empty next/data message
     # in response to the subscription. This is needed to let client know
@@ -701,7 +792,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             # Notify subclass a new client is connected.
             await self.on_connect(payload)
         except Exception as ex:  # pylint: disable=broad-except
-            LOG.warning("GraphQL connection error: %s!", ex, exc_info=ex)
+            # eva-tech: the level and text of 0.9.1, so Sentry gets the error
+            # and groups it in the same issue.
+            LOG.error(str(ex))
             if self._graphql_ws_subprotocol == "graphql-transport-ws":
                 LOG.warning(
                     "The WebSocket connection will be closed due to: Forbidden!"
@@ -953,9 +1046,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     # IntrospectionQuery. There no real resolvers. Only
                     # the type information.
                     middleware_manager = None
-                # eva-tech: unlike 0.9.1 this runs in the event loop, where an ORM
-                # resolver raises. evapacs-back clients only send subscriptions.
-                exec_result = graphql.execution.execute(
+                # eva-tech: run in the pool, as 0.9.1 did. In the event loop an
+                # ORM resolver raises and a slow one blocks every socket.
+                exec_result = await self._run_in_worker(
+                    graphql.execution.execute,
                     self.schema.graphql_schema,
                     document=doc_ast,
                     root_value=None,
@@ -1164,11 +1258,30 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             result = await self._run_in_worker(deserialize_and_execute)  # type: ignore
             result = await result if inspect.isawaitable(result) else result
             result = cast(graphql.ExecutionResult, result)
-            # Skip notification if subscription returned `None`.
-            if not result.errors and result.data:
-                for key in list(result.data.keys()):
-                    if result.data[key] is None:
-                        result.data.pop(key)
+            # eva-tech: as 0.9.1, `None` from `publish` sends the field as null and
+            # only `SKIP` drops the notification.
+            if any(
+                isinstance(error.original_error, SkippedNotification)
+                for error in result.errors or []
+            ):
+                return graphql.ExecutionResult(data=None, errors=None)
+            # eva-tech: 0.9.1 ran `publish` outside the execution, so its exception
+            # went out unlocated, as "<class name>: <message>".
+            if result.errors:
+                result.errors = [
+                    (error.original_error if _raised_by_publish(error) else error)
+                    for error in result.errors
+                ]
+                # eva-tech: 0.9.1 only logged the errors of the fields below
+                # `publish`, and the notification went out without them.
+                for error in result.errors:
+                    if _raised_below_publish(error):
+                        _log_like_graphql_core_2(
+                            error, self.schema.graphql_schema, document
+                        )
+                result.errors = [
+                    error for error in result.errors if not _raised_below_publish(error)
+                ] or None
             return result
 
         # Map every source value to a ExecutionResult value.
@@ -1220,16 +1333,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             # eva-tech: a sync `subscribe` runs in a worker thread. This method
             # runs in the event loop thread, where Django refuses ORM queries
             # (SynchronousOnlyOperation), and access checks query the database.
-            try:
-                subclass_groups = await call_maybe_sync(
-                    subscription_class._meta.subscribe, root, info, *args, **kwds
-                )
-            except Exception as ex:
-                # eva-tech: locate it like a resolver error, as 0.9.1 sent it: the
-                # plain message with `locations` and `path`, not "Class: message".
-                raise graphql.located_error(
-                    ex, info.field_nodes, info.path.as_list()
-                ) from ex
+            subclass_groups = await call_maybe_sync(
+                subscription_class._meta.subscribe, root, info, *args, **kwds
+            )
             assert subclass_groups is None or isinstance(
                 subclass_groups, (list, tuple)
             ), (
@@ -1448,11 +1554,12 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         for ex in errors or []:
             # Typical exception here is `GraphQLLocatedError` which has
             # reference to the original error raised from a resolver.
-            tb = ex.__traceback__
-            LOG.warning(
-                "GraphQL resolver failed! Operation id: %s:\n%s",
+            # eva-tech: the level and text of 0.9.1, so Sentry gets the error
+            # and groups it in the same issue.
+            LOG.error(
+                "GraphQL resolver failed on operation with id=%s:\n%s",
                 op_id,
-                "".join(traceback.format_exception(type(ex), ex, tb)).strip(),
+                _loggable_traceback(ex),
             )
 
         await self.send_json(
@@ -1495,9 +1602,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         """
         formatted_errors = []
         for error in errors:
-            LOG.warning(
-                "Operation %s processing error: %s!", op_id, error, exc_info=error
-            )
+            # eva-tech: the level and text of 0.9.1, so Sentry gets the error
+            # and groups it in the same issue.
+            LOG.error("GraphQL query processing error: %s", _loggable_traceback(error))
             formatted_error = self._format_error(error)
             formatted_errors.append(formatted_error)
         payload = (
@@ -1568,19 +1675,11 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         this function in a subclass. Another way to enrich errors is to
         use a GraphQLError based classes for your exceptions.
         """
+        # eva-tech: format as 0.9.1 did, without the "extensions.code" this
+        # docstring describes. A failed `subscribe` arrives here unwrapped.
         if isinstance(error, graphql.error.GraphQLError):
-            if error.extensions and "code" not in error.extensions:
-                if error.original_error:
-                    error.extensions["code"] = type(error.original_error).__name__
             return error.formatted
-
-        # Usually the GraphQL-core library wraps any exception with
-        # GraphQLError. So this code should be unreachable, unless there
-        # are some bugs in the library.
-        return {
-            "message": f"{type(error).__name__}: {str(error)}",
-            "extensions": {"code": type(error).__name__},
-        }
+        return {"message": f"{type(error).__name__}: {str(error)}"}
 
     def _spawn_background_task(self, awaitable):
         """Spawn background task.

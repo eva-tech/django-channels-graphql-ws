@@ -51,9 +51,23 @@ change is marked `eva-tech:` in the code.
 - A STOP that arrives while a sync `subscribe` runs in the pool now
   unsubscribes. The subscribe waits until the operation is registered,
   as 0.9.1 did, instead of until the notifier task starts.
-- A failing `subscribe` sends its error with `locations` and `path` and
-  without the exception class prefix, as 0.9.1 did. A notification that
-  fails outside the resolvers ends its operation and frees its id.
+- A failing `subscribe` sends its error as "<class name>: <message>",
+  without `locations`, `path` or `extensions`, as 0.9.1 did. A
+  notification that fails outside the resolvers ends its operation and
+  frees its id.
+- Errors carry no `extensions.code`, as in 0.9.1.
+- Queries and mutations sent over the socket run in the thread pool, as
+  in 0.9.1, so their ORM resolvers work.
+- `publish` works as in 0.9.1: returning `Subscription.SKIP` sends
+  nothing to that client, and returning `None` sends the field as null.
+  1.0.0rc7 dropped the notification on `None` and had no `SKIP`. An
+  exception raised by `publish` goes out as "<class name>: <message>",
+  without `locations` or `path`, as in 0.9.1. An exception raised by a
+  field below `publish` is logged as graphql-core 2 logged it and is not
+  sent; the field goes out as null, as in 0.9.1.
+- A rejected connection, a failed resolver and a failed operation are
+  logged as ERROR with the text of 0.9.1. The log has the traceback of
+  the original exception, never the query text graphql-core 3 adds.
 - Requirements: Python >=3.10, Django 4.2.*, graphql-core 3.2.13.
 
 ## [1.0.0rc7] - 2023-08-17

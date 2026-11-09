@@ -192,8 +192,7 @@ async def test_failed_sync_subscribe_closes_the_connection(
     )
     errors, data = await client.receive_error(sub_id)
     assert data is None
-    assert errors[0]["message"] == OnUserCount.ERROR
-    assert errors[0]["path"] == ["on_user_count"]
+    assert errors == [{"message": f"RuntimeError: {OnUserCount.ERROR}"}]
     if subprotocol == "graphql-ws":
         await client.receive_complete(sub_id)
 
@@ -242,7 +241,8 @@ async def test_sync_subscription_callbacks_run_in_the_pool(gql, subprotocol):
 async def test_failed_subscribe_graphql_ws_sends_data_then_complete(gql):
     """With graphql-ws a failing `subscribe` ends with data and complete.
 
-    0.9.1 answered the same way, and the front waits for the complete.
+    0.9.1 answered the same way, and the front waits for the complete. The
+    error is "<class name>: <message>", without locations, path or extensions.
     """
     client = gql(
         subscription=Subscription,
@@ -254,10 +254,7 @@ async def test_failed_subscribe_graphql_ws_sends_data_then_complete(gql):
     sub_id = await client.start(query="subscription { on_failing_subscribe { value } }")
     errors, data = await client.receive_error(sub_id)
     assert data is None
-    assert len(errors) == 1
-    assert errors[0]["message"] == OnFailingSubscribe.ERROR
-    assert errors[0]["path"] == ["on_failing_subscribe"]
-    assert errors[0]["locations"] == [{"line": 1, "column": 16}]
+    assert errors == [{"message": f"RuntimeError: {OnFailingSubscribe.ERROR}"}]
     await client.receive_complete(sub_id)
     await client.assert_no_messages()
 
@@ -280,11 +277,62 @@ async def test_failed_subscribe_graphql_transport_ws_sends_only_error(gql):
     sub_id = await client.start(query="subscription { on_failing_subscribe { value } }")
     errors, data = await client.receive_error(sub_id)
     assert data is None
-    assert len(errors) == 1
-    assert errors[0]["message"] == OnFailingSubscribe.ERROR
-    assert errors[0]["path"] == ["on_failing_subscribe"]
-    assert errors[0]["locations"] == [{"line": 1, "column": 16}]
+    assert errors == [{"message": f"RuntimeError: {OnFailingSubscribe.ERROR}"}]
     await client.assert_no_messages()
+
+    await client.finalize()
+
+
+@pytest.mark.asyncio
+async def test_failed_subscribe_is_logged_as_error(gql, caplog):
+    """The failure is logged as ERROR, as 0.9.1 logged it, so Sentry gets it."""
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol="graphql-ws",
+    )
+    await client.connect_and_init()
+
+    sub_id = await client.start(query="subscription { on_failing_subscribe { value } }")
+    await client.receive_error(sub_id)
+    await client.receive_complete(sub_id)
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("GraphQL resolver failed on operation")
+    ]
+    assert [record.levelname for record in records] == ["ERROR"]
+
+    await client.finalize()
+
+
+@pytest.mark.asyncio
+async def test_resolver_error_log_has_no_query_text(gql, caplog):
+    """The log has the original exception, not the query graphql-core 3 adds.
+
+    The query can carry patient data in its literals.
+    """
+    client = gql(
+        query=Query,
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol="graphql-ws",
+    )
+    await client.connect_and_init()
+
+    op_id = await client.start(query='query { failing(text: "ZZZTEST") }')
+    await client.receive_error(op_id)
+    await client.receive_complete(op_id)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("GraphQL resolver failed on operation")
+    ]
+    assert len(messages) == 1
+    assert f"RuntimeError: {Query.ERROR}" in messages[0]
+    assert "ZZZTEST" not in messages[0]
 
     await client.finalize()
 
@@ -622,6 +670,150 @@ async def test_execution_context_class_runs_every_operation(gql, subprotocol):
     await client.finalize()
 
 
+# ------------------------------------------ QUERIES OVER THE WEBSOCKET
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_query_over_the_socket_runs_in_the_pool(
+    gql, closable_sqlite, subprotocol
+):
+    """A query sent over the socket runs its ORM resolver in the pool.
+
+    0.9.1 ran the whole operation in the pool. In the event loop thread
+    Django raises SynchronousOnlyOperation for the ORM query.
+    """
+    del closable_sqlite
+    Query.threads.clear()
+    user_count = await channels.db.database_sync_to_async(User.objects.count)()
+    client = gql(
+        query=Query,
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol=subprotocol,
+    )
+    await client.connect_and_init()
+
+    op_id = await client.start(query="query { user_count }")
+    resp = await client.receive_next(op_id)
+    assert resp == {"data": {"user_count": user_count}}
+    await client.receive_complete(op_id)
+    assert Query.threads["user_count"].startswith("GraphqlWs.")
+
+    await client.finalize()
+
+
+# --------------------------------------------------- PUBLISH RETURNS NONE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_publish_returning_none_sends_null(gql, subprotocol):
+    """A `publish` that returns `None` sends the field as null, as 0.9.1 did.
+
+    1.0.0rc7 dropped such a notification, and the client got nothing.
+    """
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol=subprotocol,
+    )
+    await client.connect_and_init()
+
+    sub_id = await client.start(query="subscription { on_nothing { value } }")
+    await client.assert_no_messages()
+    await OnNothing.broadcast_async(payload=None)
+    resp = await client.receive_next(sub_id)
+    assert resp == {"data": {"on_nothing": None}}
+
+    await client.finalize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_async_publish_returning_skip_sends_nothing(gql, subprotocol):
+    """An async `publish` that returns `SKIP` sends nothing, as in 0.9.1."""
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol=subprotocol,
+    )
+    await client.connect_and_init()
+
+    sub_id = await client.start(query="subscription { on_skipped { value } }")
+    await client.assert_no_messages()
+    await OnSkipped.broadcast_async(payload="skip")
+    await client.assert_no_messages("SKIP sent a notification!")
+    await OnSkipped.broadcast_async(payload="send")
+    resp = await client.receive_next(sub_id)
+    assert resp == {"data": {"on_skipped": {"value": "send"}}}
+
+    await client.finalize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_publish_exception_is_sent_unlocated(gql, subprotocol):
+    """An exception of `publish` goes out as "<class name>: <message>", as in 0.9.1.
+
+    0.9.1 ran `publish` outside the GraphQL execution, so the error had no
+    `locations` or `path`.
+    """
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol=subprotocol,
+    )
+    await client.connect_and_init()
+
+    sub_id = await client.start(query="subscription { on_skipped { value } }")
+    await client.assert_no_messages()
+    await OnSkipped.broadcast_async(payload="fail")
+    with pytest.raises(channels_graphql_ws.GraphqlWsResponseError) as exc_info:
+        await client.receive_next(sub_id)
+    assert exc_info.value.response["payload"] == {
+        "data": {"on_skipped": None},
+        "errors": [{"message": f"RuntimeError: {OnSkipped.ERROR}"}],
+    }
+
+    await client.finalize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subprotocol", ["graphql-transport-ws", "graphql-ws"])
+async def test_child_field_error_is_logged_and_not_sent(gql, caplog, subprotocol):
+    """A field below `publish` that raises is only logged, as in 0.9.1.
+
+    graphql-core 2 logged it and 0.9.1 sent the notification with the
+    field as null and no errors.
+    """
+    client = gql(
+        subscription=Subscription,
+        consumer_attrs={"strict_ordering": True},
+        subprotocol=subprotocol,
+    )
+    await client.connect_and_init()
+
+    sub_id = await client.start(query="subscription { on_skipped { value broken } }")
+    await client.assert_no_messages()
+    await OnSkipped.broadcast_async(payload="ZZZTEST")
+    resp = await client.receive_next(sub_id)
+    assert resp == {"data": {"on_skipped": {"value": "ZZZTEST", "broken": None}}}
+
+    executor_logs = [
+        record
+        for record in caplog.records
+        if record.name == "graphql.execution.executor"
+    ]
+    assert [record.getMessage() for record in executor_logs] == [
+        "An error occurred while resolving field OnSkipped.broken"
+    ]
+    assert executor_logs[0].levelname == "ERROR"
+    assert executor_logs[0].exc_info[1].args == (OnSkipped.CHILD_ERROR,)
+
+    await client.finalize()
+
+
 # --------------------------------------------------------------- SCHEMA
 
 
@@ -780,10 +972,53 @@ class OnSlowSubscribe(channels_graphql_ws.Subscription):
         OnSlowSubscribe.unsubscribed_calls += 1
 
 
+class OnNothing(channels_graphql_ws.Subscription):
+    """Subscription whose `publish` returns `None`."""
+
+    # pylint: disable=arguments-differ
+
+    value = graphene.String()
+
+    @staticmethod
+    def publish(payload, info):
+        """Send nothing."""
+        del payload, info
+
+
+class OnSkipped(channels_graphql_ws.Subscription):
+    """Subscription whose async `publish` skips "skip" and fails on "fail"."""
+
+    # pylint: disable=arguments-differ
+
+    ERROR = "Publish failed!"
+    CHILD_ERROR = "Child failed!"
+
+    value = graphene.String()
+    broken = graphene.String()
+
+    @staticmethod
+    async def publish(payload, info):
+        """Skip "skip", send anything else."""
+        del info
+        if payload == "skip":
+            return OnSkipped.SKIP
+        if payload == "fail":
+            raise RuntimeError(OnSkipped.ERROR)
+        return OnSkipped(value=payload)
+
+    @staticmethod
+    def resolve_broken(root, info):
+        """Fail, as a child field resolver can."""
+        del root, info
+        raise RuntimeError(OnSkipped.CHILD_ERROR)
+
+
 class Subscription(graphene.ObjectType):
     """Root subscription."""
 
     on_event = OnEvent.Field()
+    on_nothing = OnNothing.Field()
+    on_skipped = OnSkipped.Field()
     on_failing_subscribe = OnFailingSubscribe.Field()
     on_slow_subscribe = OnSlowSubscribe.Field()
     on_user_count = OnUserCount.Field()
@@ -793,11 +1028,29 @@ class Query(graphene.ObjectType):
     """Root query."""
 
     VALUE = "Hi!"
+    ERROR = "Resolver failed!"
+
+    threads: dict = {}
 
     value = graphene.String()
+    user_count = graphene.Int()
+    failing = graphene.String(text=graphene.String())
 
     @staticmethod
     def resolve_value(root, info):
         """Return a constant."""
         del root, info
         return Query.VALUE
+
+    @staticmethod
+    def resolve_user_count(root, info):
+        """Record the thread and count the users with the ORM."""
+        del root, info
+        Query.threads["user_count"] = threading.current_thread().name
+        return User.objects.count()
+
+    @staticmethod
+    def resolve_failing(root, info, text):
+        """Fail, as a resolver that rejects its input does."""
+        del root, info, text
+        raise RuntimeError(Query.ERROR)

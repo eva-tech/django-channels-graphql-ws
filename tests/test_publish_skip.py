@@ -91,8 +91,9 @@ async def test_publish_skip(gql, subprotocol):
         def publish(payload, info):
             """Notify all clients except the author of the message."""
             sessionid = sessionid_from_headers(info.context.channels_scope["headers"])
+            # eva-tech: 0.9.1's `SKIP`. `None` would send the field as null.
             if payload["author_sessionid"] == sessionid:
-                return None
+                return OnNewMessage.SKIP
 
             return OnNewMessage(message=payload["message"])
 

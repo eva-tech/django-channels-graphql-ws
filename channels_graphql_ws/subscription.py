@@ -40,7 +40,7 @@ import graphene.types.utils
 import graphene.utils.get_unbound_function
 import graphene.utils.props
 
-from .graphql_ws_consumer import GraphqlWsConsumer
+from .graphql_ws_consumer import GraphqlWsConsumer, SkippedNotification
 from .serializer import Serializer
 
 # Module logger.
@@ -64,10 +64,9 @@ class Subscription(graphene.ObjectType):
         [async] publish(payload, info, *args, **kwds):
             This method invoked each time subscription "triggers".
             Raising an exception here will lead to sending the
-            notification with the error. Technically the WebSocket
-            message will contain extra field "extensions.code" holding
-            the classname of the exception raised. To suppress the
-            notification return `None`.
+            notification with the error. To suppress the notification
+            return `Subscription.SKIP`. Returning `None` sends the
+            field as null. eva-tech: as in 0.9.1.
 
             Can be implemented as both asynchronous (`async def`) or
             synchronous (`def`) function. Asynchronous implementation
@@ -86,7 +85,8 @@ class Subscription(graphene.ObjectType):
                     information.
                 args, kwds: Values of the GraphQL subscription inputs.
             Returns:
-                The same that any Graphene resolver returns.
+                The same that any Graphene resolver returns, or
+                `Subscription.SKIP` to send nothing to this client.
 
         [async] subscribe(root, info, *args, **kwds):
             Called when client subscribes. Define this to do some extra
@@ -154,6 +154,10 @@ class Subscription(graphene.ObjectType):
     """
 
     # ----------------------------------------------------------------------- PUBLIC API
+
+    # eva-tech: 0.9.1's API. Return this from the `publish` to suppress the
+    # notification.
+    SKIP = GraphqlWsConsumer.SKIP
 
     # Subscription notifications queue limit. Set this to control the
     # amount of notifications server keeps in the queue when
@@ -293,10 +297,32 @@ class Subscription(graphene.ObjectType):
                 on_new_chat_message = OnNewChatMessage.Field()
 
         """
+        publish = cls._meta.publish
+
+        # eva-tech: turn `SKIP` into an error that the notification step
+        # drops, because the resolver result goes on to its fields.
+        if asyncio.iscoroutinefunction(publish):
+
+            async def resolver(root, info, *args, **kwds):
+                """Await `publish` and raise if it returned `SKIP`."""
+                result = await publish(root, info, *args, **kwds)
+                if result is cls.SKIP:
+                    raise SkippedNotification()
+                return result
+
+        else:
+
+            def resolver(root, info, *args, **kwds):
+                """Call `publish` and raise if it returned `SKIP`."""
+                result = publish(root, info, *args, **kwds)
+                if result is cls.SKIP:
+                    raise SkippedNotification()
+                return result
+
         return graphene.Field(
             cls._meta.output,
             args=cls._meta.arguments,
-            resolver=cls._meta.publish,
+            resolver=resolver,
             name=name,
             description=description,
             deprecation_reason=deprecation_reason,

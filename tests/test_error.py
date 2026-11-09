@@ -196,9 +196,8 @@ async def test_wrong_message_type_error(gql, subprotocol):
         assert isinstance(
             payload["errors"][0]["message"], str
         ), "Error's message  must be of str type!"
-        assert (
-            payload["errors"][0]["extensions"]["code"] == "Exception"
-        ), "Error must have 'code' field."
+        # eva-tech: 0.9.1 sent no "extensions.code".
+        assert "extensions" not in payload["errors"][0]
 
     print("Disconnect and wait the application to finish gracefully.")
     await client.assert_no_messages()
@@ -286,9 +285,8 @@ async def test_connection_error(gql, subprotocol):
     if subprotocol == "graphql-ws":
         resp = await client.receive(assert_type="connection_error")
         assert resp["message"] == "RuntimeError: Connection rejected!"
-        assert (
-            resp["extensions"]["code"] == "RuntimeError"
-        ), "Error should have 'extensions' with 'code'."
+        # eva-tech: 0.9.1 sent no "extensions.code".
+        assert "extensions" not in resp
         await client.wait_disconnect()
     else:
         await client.wait_disconnect(assert_code=4403)
@@ -337,9 +335,8 @@ async def test_subscribe_return_value(gql, subprotocol):
             "There is no error in response"
             " to the wrong type of the `subscribe` result!"
         )
-        assert (
-            errors[0]["extensions"]["code"] == "AssertionError"
-        ), "Error should have 'extensions' with 'code'."
+        # eva-tech: 0.9.1 sent no "extensions.code".
+        assert "extensions" not in errors[0]
 
         await client.finalize()
 
