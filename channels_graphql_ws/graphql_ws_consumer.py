@@ -45,6 +45,8 @@ the `graphql-ws` protocol is written through a slash.
 """
 
 import asyncio
+import concurrent.futures
+import contextvars
 import dataclasses
 import functools
 import inspect
@@ -55,6 +57,7 @@ import traceback
 import weakref
 from typing import (
     Any,
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -76,12 +79,118 @@ import graphql.error
 import graphql.execution
 import graphql.pyutils
 import graphql.utilities
+from graphql.execution.execute import assert_valid_execution_arguments
+from graphql.execution.subscribe import execute_subscription
 
 from .dict_as_object import DictAsObject
 from .serializer import Serializer
 
 # Module logger.
 LOG = logging.getLogger(__name__)
+
+
+async def call_maybe_sync(function, *args, **kwds):
+    """Await an async callback, or run a sync one in a worker thread.
+
+    eva-tech: sync callbacks use the Django ORM, which is not allowed in the
+    event loop thread. They run in the consumer's own thread pool, as in 0.9.1,
+    not in asgiref's single shared thread (`database_sync_to_async` with
+    thread_sensitive=True), where every `subscribe`, `publish` and
+    `unsubscribed` of the process waited in one line.
+    """
+    if asyncio.iscoroutinefunction(function):
+        return await function(*args, **kwds)
+    result = await GraphqlWsConsumer._run_in_worker(function, *args, **kwds)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _loggable_traceback(error: BaseException) -> str:
+    """Format `error` as 0.9.1 logged it, without the query text.
+
+    eva-tech: graphql-core 3 adds the query to `str(GraphQLError)`, so log the
+    original exception, or only the message when there is none.
+    """
+    if isinstance(error, graphql.GraphQLError):
+        if error.original_error is None:
+            return f"{type(error).__name__}: {error.message}"
+        error = error.original_error
+    return "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    ).strip()
+
+
+def _raised_by_publish(error: graphql.GraphQLError) -> bool:
+    """Tell whether `publish`, the root field resolver, raised `error`."""
+    return (
+        error.original_error is not None
+        and not isinstance(error.original_error, graphql.GraphQLError)
+        and error.path is not None
+        and len(error.path) == 1
+    )
+
+
+def _raised_below_publish(error: Exception) -> bool:
+    """Tell whether a resolver of a field below `publish` raised `error`."""
+    return (
+        isinstance(error, graphql.GraphQLError)
+        and error.path is not None
+        and len(error.path) > 1
+    )
+
+
+def _log_like_graphql_core_2(
+    error: graphql.GraphQLError,
+    schema: graphql.GraphQLSchema,
+    document: graphql.DocumentNode,
+):
+    """Log a field error with the loggers and texts of graphql-core 2.
+
+    eva-tech: 0.9.1 ran on graphql-core 2, which logged it this way, so the
+    error keeps its Sentry issue.
+    """
+    original = error.original_error or error
+    field_node = error.nodes[0] if error.nodes else None
+    parent_name = _parent_type_name(schema, document, field_node)
+    field_name = field_node.name.value if field_node else error.path[-1]
+    logging.getLogger("graphql.execution.executor").error(
+        "An error occurred while resolving field %s.%s",
+        parent_name,
+        field_name,
+        exc_info=(type(original), original, original.__traceback__),
+    )
+    logging.getLogger("graphql.execution.utils").error(
+        "".join(
+            traceback.format_exception(type(original), original, original.__traceback__)
+        )
+    )
+
+
+def _parent_type_name(schema, document, field_node) -> Optional[str]:
+    """Return the name of the type that holds `field_node` in `document`."""
+    if field_node is None:
+        return None
+    type_info = graphql.TypeInfo(schema)
+    found = []
+
+    class FindParent(graphql.Visitor):
+        """Record the parent type when the visit reaches `field_node`."""
+
+        def enter_field(self, node, *_args):
+            """Stop at the field node of the error."""
+            if node is field_node:
+                parent = type_info.get_parent_type()
+                found.append(parent.name if parent else None)
+                return graphql.BREAK
+            return None
+
+    graphql.visit(document, graphql.TypeInfoVisitor(type_info, FindParent()))
+    return found[0] if found else None
+
+
+class SkippedNotification(Exception):
+    """Raised by the `publish` resolver when `publish` returned `SKIP`."""
 
 
 class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
@@ -128,6 +237,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     # are still processed asynchronously. Useful for tests.
     strict_ordering: bool = False
 
+    # eva-tech: 0.9.1's marker. A `publish` that returns it sends nothing to
+    # that client, while a `publish` that returns `None` sends null.
+    SKIP = object()
+
     # When set to `True` the server will send an empty next/data message
     # in response to the subscription. This is needed to let client know
     # when the subscription activates, so he can be sure he doesn't miss
@@ -147,6 +260,14 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     # notifications (for a single subscription) than the given number,
     # then an oldest notification is dropped and a warning is logged.
     subscription_notification_queue_limit: int = 1024
+
+    # eva-tech: 0.9.1's knob. The maximum number of threads of the pool that
+    # runs sync `subscribe`, `unsubscribed` and each notification's
+    # `graphql.execute` (with `publish`). `None` means the default of
+    # `concurrent.futures.ThreadPoolExecutor`, min(32, CPUs + 4). Read when
+    # the pool is created, at the first use in the process, so set it on
+    # `GraphqlWsConsumer` before the first subscription.
+    max_worker_threads: Optional[int] = None
 
     # GraphQL middleware.
     # Instance of `graphql.MiddlewareManager` or the list of functions
@@ -194,8 +315,48 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
 
     # ------------------------------------------------------------------- IMPLEMENTATION
 
+    # eva-tech: 0.9.1's pool, same thread name and same default size, one per
+    # process. Created on first use (see `max_worker_threads`).
+    _workers: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    @staticmethod
+    async def _run_in_worker(func, *args, **kwds):
+        """Run a sync function in the consumer's thread pool.
+
+        eva-tech: 0.9.1's `_run_in_worker`. Calls `close_old_connections`
+        before and after, the same function `database_sync_to_async` calls,
+        so the threads don't keep connections past `CONN_MAX_AGE`. Runs in a
+        copy of the caller's context, like asgiref, so asgiref `Local`s such
+        as the active translation keep their value.
+        """
+        if GraphqlWsConsumer._workers is None:
+            GraphqlWsConsumer._workers = concurrent.futures.ThreadPoolExecutor(
+                thread_name_prefix="GraphqlWs.",
+                max_workers=GraphqlWsConsumer.max_worker_threads,
+            )
+        context = contextvars.copy_context()
+
+        def thread_func():
+            channels.db.close_old_connections()
+            try:
+                return context.run(func, *args, **kwds)
+            finally:
+                channels.db.close_old_connections()
+
+        return await asyncio.get_running_loop().run_in_executor(
+            GraphqlWsConsumer._workers, thread_func
+        )
+
     # A prefix of Channel groups with subscription notifications.
-    group_name_prefix: str = "GQLWS"
+    # eva-tech: 0.9.1's prefix, not upstream's "GQLWS". Services on 0.9.1 and on
+    # this fork share the Redis groups during a deploy or a rollback, so a
+    # broadcast from either version reaches every subscriber. Subscription reads
+    # it from this class, so it can't be overridden in a subclass.
+    group_name_prefix: str = "GRAPHQL_WS_SUBSCRIPTION"
+
+    # eva-tech: the execution context of every operation on the socket, as
+    # `GraphQLView.execution_context_class` is for HTTP. None keeps graphql-core's.
+    execution_context_class: Optional[Type[graphql.ExecutionContext]] = None
 
     # Structure that holds subscription information.
     @dataclasses.dataclass
@@ -631,7 +792,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             # Notify subclass a new client is connected.
             await self.on_connect(payload)
         except Exception as ex:  # pylint: disable=broad-except
-            LOG.warning("GraphQL connection error: %s!", ex, exc_info=ex)
+            # eva-tech: the level and text of 0.9.1, so Sentry gets the error
+            # and groups it in the same issue.
+            LOG.error(str(ex))
             if self._graphql_ws_subprotocol == "graphql-transport-ws":
                 LOG.warning(
                     "The WebSocket connection will be closed due to: Forbidden!"
@@ -759,6 +922,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     op_name,
                 )
 
+                # eva-tech: set once `subscribe` ran and the operation is in
+                # the registry, or once it failed.
+                registered = asyncio.Event()
+
                 # This returns asynchronous generator or ExecutionResult
                 # instance in case of error.
                 subscription_result = await self._on_gql_subscribe__create_subscription(
@@ -767,10 +934,12 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     root_value=None,
                     variable_values=variables,
                     context_value=context,
+                    execution_context_class=self.execution_context_class,
                     subscribe_field_resolver=functools.partial(
                         self._on_gql_subscribe__initialize_subscription_stream,
                         op_id,
                         op_name,
+                        registered,
                     ),
                     middleware=self._middleware,
                 )
@@ -792,10 +961,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                             errors=self.subscription_confirmation_message["errors"],
                         )
 
-                    consumer_init_done = asyncio.Event()
-
                     async def consume_stream():
-                        consumer_init_done.set()
                         try:
                             async for item in stream:
                                 # Skipped subscription event may have no
@@ -819,11 +985,20 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                             if self._graphql_ws_subprotocol == "graphql-transport-ws":
                                 await self._send_gql_error(op_id, [ex])
                             else:
+                                # eva-tech: `subscribe` runs here, on the first
+                                # read of the stream. 0.9.1 ran it before
+                                # answering and ended a failed one with data and
+                                # complete, so this ends it the same way.
                                 await self._send_gql_next(op_id, None, [ex])
+                                await self._send_gql_complete(op_id)
+                            # eva-tech: the error ended the operation. Drop it, or
+                            # each later broadcast fills a queue nobody reads.
+                            await self._on_gql_complete(op_id, from_notifier=True)
 
                     # We need to end this task when client drops
                     # connection or unsubscribes, so lets store it.
-                    self._notifier_tasks[op_id] = asyncio.create_task(consume_stream())
+                    notifier_task = asyncio.create_task(consume_stream())
+                    self._notifier_tasks[op_id] = notifier_task
 
                     # We must be sure here that the subscription
                     # initialization is finished and the stream consumer
@@ -834,7 +1009,18 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     # actually is.
                     # This allows us to avoid the race condition between
                     # simultaneous subscribe and unsubscribe calls.
-                    await consumer_init_done.wait()
+                    # eva-tech: wait until `subscribe` registered the operation. It
+                    # runs in the pool, and a STOP before it ended found nothing.
+                    registered_task = asyncio.create_task(registered.wait())
+                    try:
+                        await asyncio.wait(
+                            [registered_task, notifier_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        # eva-tech: a disconnect cancels this wait, and then
+                        # nothing sets `registered`, so the task would hang.
+                        registered_task.cancel()
                     return
 
                 # Else (when gql_subscribe returns ExecutionResult
@@ -860,7 +1046,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     # IntrospectionQuery. There no real resolvers. Only
                     # the type information.
                     middleware_manager = None
-                exec_result = graphql.execution.execute(
+                # eva-tech: run in the pool, as 0.9.1 did. In the event loop an
+                # ORM resolver raises and a slow one blocks every socket.
+                exec_result = await self._run_in_worker(
+                    graphql.execution.execute,
                     self.schema.graphql_schema,
                     document=doc_ast,
                     root_value=None,
@@ -868,6 +1057,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     variable_values=variables,
                     context_value=context,
                     middleware=middleware_manager,
+                    execution_context_class=self.execution_context_class,
                 )
                 if inspect.isawaitable(exec_result):
                     exec_result = await exec_result
@@ -1004,17 +1194,32 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         explicit.
         """
 
-        result_or_stream = await graphql.create_source_event_stream(
-            self.schema.graphql_schema,
+        # eva-tech: the body of `graphql.create_source_event_stream` (3.2.13),
+        # which always builds the default ExecutionContext, with the consumer's
+        # context class instead. Subscription variables are then coerced as
+        # over HTTP.
+        schema = self.schema.graphql_schema
+        assert_valid_execution_arguments(schema, document, variable_values)
+        context = (execution_context_class or graphql.ExecutionContext).build(
+            schema,
             document,
             root_value,
             context_value,
             variable_values,
             operation_name,
-            subscribe_field_resolver,
+            subscribe_field_resolver=subscribe_field_resolver,
         )
-        if isinstance(result_or_stream, graphql.ExecutionResult):
-            return result_or_stream
+        if isinstance(context, list):
+            return graphql.ExecutionResult(data=None, errors=context)
+        try:
+            result_or_stream = await execute_subscription(context)
+            if not isinstance(result_or_stream, AsyncIterable):
+                raise TypeError(
+                    "Subscription field must return AsyncIterable."
+                    f" Received: {graphql.pyutils.inspect(result_or_stream)}."
+                )
+        except graphql.GraphQLError as error:
+            return graphql.ExecutionResult(data=None, errors=[error])
 
         async def map_source_to_response(payload: Any) -> graphql.ExecutionResult:
             """Map source to response.
@@ -1028,24 +1233,55 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             nearly identical to the "ExecuteQuery" algorithm, for which
             :func:`~graphql.execute` is also used.
             """
-            result = graphql.execute(
-                self.schema.graphql_schema,
-                document,
-                payload,
-                context_value,
-                variable_values,
-                operation_name,
-                field_resolver,
-                middleware=middleware,
-                execution_context_class=execution_context_class,
-            )  # type: ignore
+
+            # eva-tech: run `publish` and the resolvers of its fields in the
+            # pool, as 0.9.1 did, not in the event loop. In the loop, 200
+            # sockets of one org meant 200 executions without yielding, and
+            # channels-redis dropped broadcasts while the loop didn't read.
+            # A sync `publish` now runs inline in that thread. The payload
+            # arrives serialized and is deserialized in the same thread, one
+            # hop per notification, like 0.9.1's
+            # `trigger.on_next(Serializer.deserialize(payload))`.
+            def deserialize_and_execute():
+                return graphql.execute(
+                    self.schema.graphql_schema,
+                    document,
+                    Serializer.deserialize(payload),
+                    context_value,
+                    variable_values,
+                    operation_name,
+                    field_resolver,
+                    middleware=middleware,
+                    execution_context_class=execution_context_class,
+                )
+
+            result = await self._run_in_worker(deserialize_and_execute)  # type: ignore
             result = await result if inspect.isawaitable(result) else result
             result = cast(graphql.ExecutionResult, result)
-            # Skip notification if subscription returned `None`.
-            if not result.errors and result.data:
-                for key in list(result.data.keys()):
-                    if result.data[key] is None:
-                        result.data.pop(key)
+            # eva-tech: as 0.9.1, `None` from `publish` sends the field as null and
+            # only `SKIP` drops the notification.
+            if any(
+                isinstance(error.original_error, SkippedNotification)
+                for error in result.errors or []
+            ):
+                return graphql.ExecutionResult(data=None, errors=None)
+            # eva-tech: 0.9.1 ran `publish` outside the execution, so its exception
+            # went out unlocated, as "<class name>: <message>".
+            if result.errors:
+                result.errors = [
+                    (error.original_error if _raised_by_publish(error) else error)
+                    for error in result.errors
+                ]
+                # eva-tech: 0.9.1 only logged the errors of the fields below
+                # `publish`, and the notification went out without them.
+                for error in result.errors:
+                    if _raised_below_publish(error):
+                        _log_like_graphql_core_2(
+                            error, self.schema.graphql_schema, document
+                        )
+                result.errors = [
+                    error for error in result.errors if not _raised_below_publish(error)
+                ] or None
             return result
 
         # Map every source value to a ExecutionResult value.
@@ -1055,6 +1291,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         self,
         operation_id: int,
         operation_name: str,
+        registered: asyncio.Event,
         root: Any,
         info: graphql.GraphQLResolveInfo,
         *args,
@@ -1093,12 +1330,12 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         # Invoke the subclass-specified `subscribe` method to get
         # the groups subscription must be attached to.
         if subscription_class._meta.subscribe is not None:
-            subclass_groups = subscription_class._meta.subscribe(
-                root, info, *args, **kwds
+            # eva-tech: a sync `subscribe` runs in a worker thread. This method
+            # runs in the event loop thread, where Django refuses ORM queries
+            # (SynchronousOnlyOperation), and access checks query the database.
+            subclass_groups = await call_maybe_sync(
+                subscription_class._meta.subscribe, root, info, *args, **kwds
             )
-            # Properly handle `async def subscribe`.
-            if asyncio.iscoroutinefunction(subscription_class._meta.subscribe):
-                subclass_groups = await subclass_groups
             assert subclass_groups is None or isinstance(
                 subclass_groups, (list, tuple)
             ), (
@@ -1137,10 +1374,8 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
 
             if unsubscribed is None:
                 return None
-            result = unsubscribed(None, info, *args, **kwds)
-            # Properly handle `async def unsubscribed`.
-            if inspect.isawaitable(result):
-                result = await result
+            # eva-tech: offload a sync `unsubscribed`, as the docstring says.
+            result = await call_maybe_sync(unsubscribed, None, info, *args, **kwds)
 
         def enqueue_notification(payload):
             """Put notification to the queue.
@@ -1201,10 +1436,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         )
         if wait_list:
             await asyncio.wait(wait_list)
-
-        _deserialize = channels.db.database_sync_to_async(
-            Serializer.deserialize, thread_sensitive=False
-        )
+        registered.set()
 
         # For each notification (event) yielded from this function the
         # `_on_gql_subscribe__create_subscription` function will call
@@ -1213,15 +1445,19 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         while True:
             with notification_queue_lock:
                 payload = await notification_queue.get()
-            data = await _deserialize(payload)
-            yield data
+            # eva-tech: yield the serialized payload. `map_source_to_response`
+            # deserializes it in the pool, in the same hop as `graphql.execute`.
+            yield payload
             with notification_queue_lock:
                 notification_queue.task_done()
 
-    async def _on_gql_complete(self, op_id):
+    async def _on_gql_complete(self, op_id, *, from_notifier=False):
         """Process the COMPLETE/STOP message.
 
         Handle an unsubscribe request.
+
+        eva-tech: with `from_notifier` the notifier task drops its own
+        operation after a failure it already reported to the client.
 
         NOTE: Depending on the value of the `strict_ordering` setting
         this method is either awaited directly or offloaded to an async
@@ -1243,7 +1479,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
 
         # Cancel the task which watches the notification queue.
         consumer_task = self._notifier_tasks.pop(op_id, None)
-        if consumer_task:
+        if consumer_task and not from_notifier:
             consumer_task.cancel()
             wait_list.append(consumer_task)
 
@@ -1272,7 +1508,8 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         await sub_inf.unsubscribed_callback()
 
         # Send the unsubscription confirmation message.
-        await self._send_gql_complete(op_id)
+        if not from_notifier:
+            await self._send_gql_complete(op_id)
 
     # -------------------------------------------------------- GRAPHQL PROTOCOL MESSAGES
 
@@ -1317,11 +1554,12 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         for ex in errors or []:
             # Typical exception here is `GraphQLLocatedError` which has
             # reference to the original error raised from a resolver.
-            tb = ex.__traceback__
-            LOG.warning(
-                "GraphQL resolver failed! Operation id: %s:\n%s",
+            # eva-tech: the level and text of 0.9.1, so Sentry gets the error
+            # and groups it in the same issue.
+            LOG.error(
+                "GraphQL resolver failed on operation with id=%s:\n%s",
                 op_id,
-                "".join(traceback.format_exception(type(ex), ex, tb)).strip(),
+                _loggable_traceback(ex),
             )
 
         await self.send_json(
@@ -1364,9 +1602,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         """
         formatted_errors = []
         for error in errors:
-            LOG.warning(
-                "Operation %s processing error: %s!", op_id, error, exc_info=error
-            )
+            # eva-tech: the level and text of 0.9.1, so Sentry gets the error
+            # and groups it in the same issue.
+            LOG.error("GraphQL query processing error: %s", _loggable_traceback(error))
             formatted_error = self._format_error(error)
             formatted_errors.append(formatted_error)
         payload = (
@@ -1437,19 +1675,11 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         this function in a subclass. Another way to enrich errors is to
         use a GraphQLError based classes for your exceptions.
         """
+        # eva-tech: format as 0.9.1 did, without the "extensions.code" this
+        # docstring describes. A failed `subscribe` arrives here unwrapped.
         if isinstance(error, graphql.error.GraphQLError):
-            if error.extensions and "code" not in error.extensions:
-                if error.original_error:
-                    error.extensions["code"] = type(error.original_error).__name__
             return error.formatted
-
-        # Usually the GraphQL-core library wraps any exception with
-        # GraphQLError. So this code should be unreachable, unless there
-        # are some bugs in the library.
-        return {
-            "message": f"{type(error).__name__}: {str(error)}",
-            "extensions": {"code": type(error).__name__},
-        }
+        return {"message": f"{type(error).__name__}: {str(error)}"}
 
     def _spawn_background_task(self, awaitable):
         """Spawn background task.
