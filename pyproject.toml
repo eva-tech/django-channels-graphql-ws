@@ -51,7 +51,7 @@ python = "^3.6.0"
 aiohttp = "^3"
 asgiref = "^3"
 backports-datetime-fromisoformat = {version = "^1", python = "~3.6"}
-channels = ">=3,<5"
+channels = "^3"
 dataclasses = {version = "^0.7", python = "~3.6"}
 Django = ">=3,<6"
 graphene = "^2.1"
